@@ -35,7 +35,7 @@ sudo python3 -m pip install pyelftools
 cd ~
 wget https://fast.dpdk.org/rel/dpdk-22.11.1.tar.xz
 tar -xf dpdk-22.11.1.tar.xz
-cd dpdk-22.11.1
+cd dpdk-stable-22.11.1
 meson -Dexamples=all build
 ninja -C build
 sudo ninja -C build install
@@ -68,7 +68,7 @@ sudo ./usertools/dpdk-devbind.py --bind=vfio-pci "01:00.*"
 ## Hello World
 
 ```
-cd ~/dpdk-22.11.1
+cd ~/dpdk-stable-22.11.1
 sudo ./build/examples/dpdk-helloworld
 ```
 
@@ -104,7 +104,7 @@ dpdk的example中有一个非常简单的转发程序，能够将一个网口的
 然后运行以下命令：
 
 ```
-cd ~/dpdk-22.11.1
+cd ~/dpdk-stable-22.11.1
 sudo ./build/examples/dpdk-skeleton
 ```
 
