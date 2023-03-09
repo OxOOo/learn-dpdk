@@ -46,3 +46,5 @@ sudo ./build/examples/dpdk-skeleton
 ### 主循环
 
 主循环较为简单，不断使用`rte_eth_rx_burst`接收网卡的数据，然后使用`rte_eth_tx_burst`从另一个网卡发送出去。
+
+TODO：按照文档说明，DPDK好像会自动将多个帧合并为一个`mbuf`？然后自动在发送的时候拆分？
