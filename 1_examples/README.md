@@ -48,3 +48,39 @@ sudo ./build/examples/dpdk-skeleton
 主循环较为简单，不断使用`rte_eth_rx_burst`接收网卡的数据，然后使用`rte_eth_tx_burst`从另一个网卡发送出去。
 
 TODO：按照文档说明，DPDK好像会自动将多个帧合并为一个`mbuf`？然后自动在发送的时候拆分？
+
+## Network Layer 2 forwarding
+
+这个示例和上一个示例差不多，也是将port 0收到的数据转发到port 1，因此也可以完成`0_setup`中的示例（模拟网线的功能）：
+
+```
+sudo ./build/examples/dpdk-l2fwd -- -p 3 -P --no-mac-updating
+```
+
+相比上一个示例，增加了以下功能：
+1. -P混杂模式(`promiscuous mode`)：在上个示例该选项是默认打开的，而在本选项中默认是关闭的。当混杂模式关闭的情况下，网卡会自动检查收到数据包的dst mac，如果dst mac和网卡的mac不匹配，就会直接将数据包丢弃。
+2. --[no-]mac-updating：在启动mac updating的情况下，转发的数据包的src mac会被替换为发出数据包的mac，dst mac会被替换为02:00:00:00:00:TX_PORT_ID。
+
+所以在启用mac updating(默认启用)的情况下，是不能够完成模拟网线的功能的，但是如果修改代码，将修改dst mac的功能去掉，只保留修改src mac的功能，则依然能够完成模拟网线的功能。
+注释`l2fwd_mac_updating`中修改dst mac的代码，并运行以下命令：
+```
+sudo ./build/examples/dpdk-l2fwd -- -p 3 -P
+```
+
+### 知识点一：多线程处理数据
+这个实例还启动了多个线程处理数据，每个网口的接收会被分配给一个线程，每个线程默认负责1个网口，可以使用`-q`参数修改每个线程负责的网口数量。
+但是全局只有一个`mbuf pool`，也就是说mempool相关的操作(alloc和free)是线程安全的，经查证确实如此： https://stackoverflow.com/questions/68068452/are-the-dpdk-functions-rte-pktmbuf-alloc-and-rte-pktmbuf-free-thread-safe
+
+### 知识点二：`tx_buffer`
+为了提高性能，这个示例中从一个网口收到需要转发的数据之后，并不会马上发给另一个网口，而是先放到一个`tx_buffer`中，等到`tx_buffer`中积累的足够的数据，或者是100us之后，才会发送。
+`tx_buffer`内部就是一个简单的数组，和网口不是绑定的关系。
+TODO：相比直接使用`rte_eth_tx_burst`的提升在哪？
+
+### 知识点三：检查网口状态
+可以获取网卡是否启动(是否有网线连接)，网速等信息。
+由于在检查网卡都启动之后，马上就切换到了统计信息页面，所以看不到输出内容。可以在`check_all_ports_link_status`函数之后调用`rte_delay_ms(5000)`，输出的内容类似：`Port 0 Link up at 1 Gbps FDX Autoneg`。
+
+### 知识点四：`rte_prefetch0`
+预取指令，可以预取一条cache line到cache中，`rte_prefetch0`就是预取到所有层级的cache中。
+预取指令是一条CPU指令，预取是异步的，并不需要等到预取结束才执行之后的命令，所以理论上能够提升性能。
+参考：https://blog.csdn.net/cling60/article/details/78480725
