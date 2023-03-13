@@ -84,3 +84,15 @@ TODO：相比直接使用`rte_eth_tx_burst`的提升在哪？
 预取指令，可以预取一条cache line到cache中，`rte_prefetch0`就是预取到所有层级的cache中。
 预取指令是一条CPU指令，预取是异步的，并不需要等到预取结束才执行之后的命令，所以理论上能够提升性能。
 参考：https://blog.csdn.net/cling60/article/details/78480725
+
+## L2 Forwarding Eventdev Sample Application
+
+和上一个示例差不多，所以一样可以完成模拟网线的功能，只不过多了一种eventdev的模式。不过我的网卡不支持eventdev，所以只能使用poll模式：
+
+```
+sudo ./build/examples/dpdk-l2fwd -- -p 3 -P --no-mac-updating --mode=poll
+```
+
+TODO：什么是eventdev。
+参考：https://zhuanlan.zhihu.com/p/27990594
+参考：https://learn.microsoft.com/en-us/windows-hardware/drivers/network/rss-with-hardware-queuing
