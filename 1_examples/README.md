@@ -96,3 +96,73 @@ sudo ./build/examples/dpdk-l2fwd -- -p 3 -P --no-mac-updating --mode=poll
 TODO：什么是eventdev。
 参考：https://zhuanlan.zhihu.com/p/27990594
 参考：https://learn.microsoft.com/en-us/windows-hardware/drivers/network/rss-with-hardware-queuing
+
+## Distributor Sample Application
+
+本示例展示了如何使用多个worker协同处理数据。
+一个收到的网络数据包的处理路径：
+1. `lcore_rx`:`rte_eth_rx_burst`从网卡收到数据包
+2. `lcore_rx`:`rte_ring_enqueue_burst`将数据包发送到`rx_dist_ring`
+3. `lcore_distributor`:`rte_ring_dequeue_burst`从`rx_dist_ring`取出数据
+4. `lcore_distributor`:`rte_distributor_process`将数据交给worker线程进行处理
+4. `lcore_worker`:`rte_distributor_get_pkt`将数据从distributor取出需要处理的数据包，并且将处理完的数据包交回distributor
+5. `lcore_distributor`:`rte_distributor_returned_pkts`取回worker线程处理完成的数据
+6. `lcore_distributor`:`rte_ring_enqueue_burst`将数据放入`dist_tx_ring`
+7. `lcore_tx`:`rte_ring_dequeue_burst`将数据从`dist_tx_ring`中取出
+8. `lcore_tx`:`flush_one_port`/`flush_all_ports`将数据从网卡发送出去
+
+在`lcore_rx`:`rte_ring_enqueue_burst`出也可以直接将数据包发送到`dist_tx_ring`(代码注释的部分)，这样数据就不经过处理直接输出。
+
+TODO：在`lcore_distributor`中，使用`rte_distributor_process`分发数据之后马上就使用`rte_distributor_returned_pkts`接收处理完成的数据了，这是数据应该还没有加工完成才对？
+TODO：distributor似乎是按照flow id或tag进行分配的？
+
+### 知识点：配置RSS
+初始化的时候设置了：
+```C++
+.rx_adv_conf = {
+    .rss_conf = {
+        .rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP |
+            RTE_ETH_RSS_TCP | RTE_ETH_RSS_SCTP,
+    }
+}
+```
+并根据网卡支持的功能进行调整：
+```C++
+port_conf.rx_adv_conf.rss_conf.rss_hf &=
+		dev_info.flow_type_rss_offloads
+```
+
+### 知识点：`rte_distributor`
+使用`rte_distributor_create`创建一个distributor。
+在每个worker线程，可以使用`rte_distributor_get_pkt`函数获取到需要处理的数据`mbuf`，同时将处理结束的`mbuf`返回。
+
+注意事项：worker不能缓存`mbuf`。
+
+参考资料：
+1. https://doc.dpdk.org/guides/prog_guide/packet_distrib_lib.html
+
+### 知识点：`rte_ring`
+`rte_ring`是一个固定长度的循环队列，并且非链表，而是直接将数据储存在一块预先分配的内存空间中。
+在本例中，`rte_ring`存的是`mbuf`的指针。
+
+使用`rte_ring_create`创建一个`rte_ring`，在创建是可以指定flag，表明生产者的特征：
+1. 单生成者
+2. 多生产者模式
+2. 多生产者RTS模式
+3. 多生产者HTS模式
+`flag`设为0就是多生产者模式，其他选项分别对应另外3种模式，消费端也有类似的4个选项。
+
+参考资料：
+1. https://doc.dpdk.org/guides/prog_guide/ring_lib.html
+2. https://zhuanlan.zhihu.com/p/515046756
+
+以入队为例，分为3个阶段：
+1. 在循环队列中圈出一块空间，这个阶段需要保证多生成者同时进行入队操作时能够分配到不同的空间
+2. 将数据拷贝到循环队列中
+3. 修改`rte_ring`的变量告知入队操作结束，类似commit
+
+如果是单生产者模式，则上面3个操作不需要同步。
+如果是多生产者模式(或RTS/HTS)，则第一个操作需要使用CAS原子操作避免冲突，第2个阶段可以并发写入。第3个阶段同样需要使用CAS原子操作避免冲突。
+在第3个阶段，多生产者模式和RTS模式分别有不同的处理逻辑，前者要求commit操作依次完成，后面生产者的commit必须等待前面生产者的commit完成，因此理论上这个存在一个自旋锁。
+而RTS模式则可以由最后一个生产者进行commit即可。
+HTS则是要求所有生产者都串行执行，也就是说如果一个生产者A在第2阶段拷贝数据，那么其他生成则必须等待生产者A完成第3阶段才能从第1阶段开始执行。因此HTS是严格串行的。
