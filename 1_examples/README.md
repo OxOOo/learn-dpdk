@@ -166,3 +166,69 @@ port_conf.rx_adv_conf.rss_conf.rss_hf &=
 在第3个阶段，多生产者模式和RTS模式分别有不同的处理逻辑，前者要求commit操作依次完成，后面生产者的commit必须等待前面生产者的commit完成，因此理论上这个存在一个自旋锁。
 而RTS模式则可以由最后一个生产者进行commit即可。
 HTS则是要求所有生产者都串行执行，也就是说如果一个生产者A在第2阶段拷贝数据，那么其他生成则必须等待生产者A完成第3阶段才能从第1阶段开始执行。因此HTS是严格串行的。
+
+## Multi-process Sample Application
+
+### Basic Multi-process Example
+
+展示了两个进程如何使用共享内存进行通信，主要内容是启动两个进程，互相可以向对方发送消息。
+
+两个进程必须一个是primary另一个是secondary。
+
+#### 如何使用共享内存进行通信
+
+primary进程使用`rte_ring_create`创建`rte_ring`，使用`rte_mempool_create`创建`mempool`。
+secondary进程使用`rte_ring_lookup`和`rte_mempool_lookup`获取到primary进程创建的内存。
+在创建`rte_ring`和`mempool`的时候，都会指定一个名称，`lookup`的时候就是通过名称找到同一块内存。
+
+在这样的操作之后，两个进程就是使用同一块内存区域了。
+
+需要注意这个示例中是使用`rte_mempool_create`创建的`mempool`，而之前的示例中是使用`rte_pktmbuf_pool_create`创建的。
+
+`rte_pktmbuf_pool_create`创建的`mempool`也可以被共享？A:是的，下一个示例就是。
+
+### Symmetric Multi-process Example
+
+对称式处理程序，展示了如何运行多个进程运行相同的代码处理数据。
+
+模型网线的功能，需要分别运行以下两个命令：
+```
+sudo ./build/examples/dpdk-symmetric_mp -l 0 --proc-type=auto -- -p 3 --num-procs=2 --proc-id=0
+sudo ./build/examples/dpdk-symmetric_mp -l 1 --proc-type=auto -- -p 3 --num-procs=2 --proc-id=1
+```
+
+基本工作流程：
+1. primary进程初始化，设置每个网口接收队列和发送队列的数量=进程总数，并且设置网卡按照IP将收到的数据分配到不同的队列。
+2. 编号为x的进程检查每张网卡的第x个接收队列，如果有数据，就搬到发送网卡的第x个发送队列。
+
+由于是按照IP进行RSS切分的，所以可能会不均衡，比如我在测试中跑了一个iperf测试，0号进程处理的数据量为：
+```
+Port 0: RX - 814554, TX - 38, Drop - 0
+Port 1: RX - 38, TX - 814554, Drop - 0
+```
+1号进程处理的数据量为：
+```
+Port 0: RX - 38, TX - 44, Drop - 0
+Port 1: RX - 44, TX - 38, Drop - 0
+```
+
+### Client-Server Multi-process Example
+
+非对称式程序，Server负责所有收数据的工作，并将数据分发给Client，Client将数据包从对应的网卡中发送出去。
+
+在这个示例中，设置每个网卡只有1个接收队列，但是有client数量个发送队列。
+
+所有接收队列由Server负责，每个Client负责所有网卡的一个发送队列。
+
+同时说明，可以使用`rte_ring`发送`rte_mbuf`。
+
+模拟网线功能，启动3个进程：
+```
+sudo ./build/examples/dpdk-mp_server -l 0 -- -p 3 -n 2
+sudo ./build/examples/dpdk-mp_client -l 1 --proc-type=auto -- -n 0
+sudo ./build/examples/dpdk-mp_client -l 2 --proc-type=auto -- -n 1
+```
+
+### 总结
+
+TODO：上面两个示例中都没有出现不同进程读写相同网卡同一个队列的情况，是否是不能并发读写的？
