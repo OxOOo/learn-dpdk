@@ -232,3 +232,31 @@ sudo ./build/examples/dpdk-mp_client -l 2 --proc-type=auto -- -n 1
 ### 总结
 
 TODO：上面两个示例中都没有出现不同进程读写相同网卡同一个队列的情况，是否是不能并发读写的？
+
+## RX/TX Callbacks Sample Application
+
+本示例给接收和发送每个数据包添加了回调函数，用以统计每个数据包的延迟。
+
+模拟网线的功能：
+```
+sudo ./build/examples/dpdk-rxtx_callbacks
+```
+
+我的网卡不支持硬件时间戳，所以只使用软件计时。使用iperf进行测试，运行若干次之后，输出内容如下：
+```
+Latency = 43 cycles
+```
+我的网卡的基准频率为3.6GHz，因此每个数据包的延迟为43 cycles / 3.6 cycles/ns = 11ns。
+
+### 知识点：`rte_mbuf_dynfield_register`
+可以在`mbuf`上注册一块区域，用于存放一些自定义的数据，存放的数据会跟着`mbuf`一起走。
+`rte_mbuf_dynfield_register`会返回一个offset，然后使用`RTE_MBUF_DYNFIELD`可以获取到这个区域的地址。
+
+如果要记录每个数据包从网卡上收到的时间，则需要网卡支持，并且使用`rte_mbuf_dyn_rx_timestamp_register`获取到硬件时间戳是存放在什么位置的。
+
+### 知识点：`rte_eth_add_rx_callback`和`rte_eth_add_tx_callback`
+
+注册rx和tx的回调函数。
+
+TODO：实际上callback好像是在调用`rte_eth_rx_burst`和`rte_eth_tx_burst`时被调用的？
+TODO：能否跨进程？
