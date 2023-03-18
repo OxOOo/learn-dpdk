@@ -269,6 +269,7 @@ TODO：能否跨进程？
 如果进行了数据包拆分，则需要重新计算IP包头的checksum，可以设置`ol_flags |= (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM)`，将生成checksum的操作交给网卡完成。
 
 TODO：IPv6应该是不支持数据包拆分的？但代码中对IPv6的数据包也进行了拆分。
+A：IPv6可以IP分段(https://www.cnblogs.com/cunshen/articles/160537.html)，只不过IP分段只运行在端点执行，中间的路由节点不进行分段。
 
 ### 知识点：IP路由
 
@@ -311,3 +312,15 @@ TODO：这两有什么差别？
 对于每个待发送的数据包“拷贝”(`pkt`)，从`header_pool`中分配一个`mbuf`(`hdr`)用于存储以太网包头，然后将`hdr`和`pkt`链起来(`hdr->next = pkt`)。
 
 这也解释了`data_len`和`pkt_len`的差异：`data_len`表示一个`mbuf`的数据长度，`pkt_len`表示一整个`mbuf`链的长度之和。
+
+## IP Reassembly Sample Application
+
+这个示例展示了如何将IPv4和IPv6被分段的IP数据包整合到一起，主要使用了`rte_ip_frag_tbl`库。
+
+在`rte_ip_frag_tbl`库中，每个IP包被按照三元组<Source IP address>, <Destination IP address>, <ID>进行识别并重组。
+由于IP数据包重组需要大量内存，所以每个网口拥有独立的mempool，避免网口之间干扰。
+但其实在使用`rte_ip_frag_tbl`的时候并不需要`mempool`的介入，只不过需要将收到的`mbuf`对象交给`rte_ip_frag_tbl`，而`rte_ip_frag_tbl`并不会及时释放。
+
+使用方式：
+首先使用`rte_ip_frag_table_create`创建一个`rte_ip_frag_tbl`，然后将需要重组的数据包调用`rte_ipv4_frag_reassemble_packet`/`rte_ipv6_frag_reassemble_packet`，`rte_ip_frag_tbl`会自动将重组之后的数据包返回。
+TODO：最后还需要调用`rte_ip_frag_free_death_row`释放内存？
