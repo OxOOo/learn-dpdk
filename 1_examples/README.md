@@ -260,3 +260,29 @@ Latency = 43 cycles
 
 TODO：实际上callback好像是在调用`rte_eth_rx_burst`和`rte_eth_tx_burst`时被调用的？
 TODO：能否跨进程？
+
+## IP Fragmentation Sample Application
+
+这个示例类似`l3fwd`，额外再考虑了IP分段的问题。
+
+在本示例中，如果收到的数据包超过了MTU，那么就会使用`rte_ipv4_fragment_packet`函数将数据包拆分为多个数据包。
+如果进行了数据包拆分，则需要重新计算IP包头的checksum，可以设置`ol_flags |= (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM)`，将生成checksum的操作交给网卡完成。
+
+TODO：IPv6应该是不支持数据包拆分的？但代码中对IPv6的数据包也进行了拆分。
+
+### 知识点：IP路由
+
+对于IPv4：
+首先使用`rte_lpm_create`创建一个`rte_lpm`对象(需要指明socket)，然后使用`rte_lpm_add`将路由规则加入到`rte_lpm`中，最后在使用的时候调用`rte_lpm_lookup`进行路由查找。
+需要注意，`rte_lpm`中的规则和查找时，ip均为host编码方式。
+删除可以使用`rte_lpm_delete`函数。
+
+### 知识点：direct和indirect mempool
+
+TODO：这两有什么差别？
+
+### 知识点：`rte_pktmbuf_adj`和`rte_pktmbuf_prepend`
+
+`rte_pktmbuf_adj`可以移除数据包前面的一部分内容，`rte_pktmbuf_prepend`可以在数据包前面再增加一块内存。
+在本例中，程序对收到的每一个数据包先使用`rte_pktmbuf_adj`将以太网包头移除，这样IP包头就变成了最前面，经过路由选择之后，再使用`rte_pktmbuf_prepend`在最前面添加一个以太网包头。
+猜测其内部就是记了一个offset。
