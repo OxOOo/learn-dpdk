@@ -324,3 +324,14 @@ TODO：这两有什么差别？
 使用方式：
 首先使用`rte_ip_frag_table_create`创建一个`rte_ip_frag_tbl`，然后将需要重组的数据包调用`rte_ipv4_frag_reassemble_packet`/`rte_ipv6_frag_reassemble_packet`，`rte_ip_frag_tbl`会自动将重组之后的数据包返回。
 TODO：最后还需要调用`rte_ip_frag_free_death_row`释放内存？
+
+## Timer Sample Application
+
+一个非常小的示例，展示了如何使用timer触发定时任务。要点：
+1. 需要周期性主动调用`rte_timer_manage`函数，这样才能出发timer
+2. timer触发是回调形式的，可以指定一个void*参数
+3. 可以给其他lcore设置timer
+
+在`rte_eal_init`之后，需要额外调用`rte_timer_subsystem_init`初始化timer子系统。
+然后调用`rte_timer_init`初始化定时器，并使用`rte_timer_reset`设定定时器的触发时间与回调。
+最后在每个可能会触发timer的lcore上周期性调用`rte_timer_manage`。
