@@ -294,6 +294,7 @@ private:
     }
 };
 
+// 常驻任务，响应ICMP Ping
 class PingReplyTask : public Task
 {
 public:

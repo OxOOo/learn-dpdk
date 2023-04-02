@@ -180,7 +180,25 @@ struct Context
     {
         rte_be32_t xid; // current transaction id
     } dhcp_context;
+
+    // 一个局域网内参与测试的其他服务器的mac地址，需要用ARP协议获取。
+    struct rte_ether_addr lan_dst_mac_addr;
+
+    struct rte_ether_addr gateway_mac_addr; // 网关的MAC地址
 };
+
+// 返回`mac_addr`是否为空(全0)
+bool is_mac_addr_empty(const struct rte_ether_addr *mac_addr)
+{
+    for (int i = 0; i < RTE_ETHER_ADDR_LEN; i++)
+    {
+        if (mac_addr->addr_bytes[i] > 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
 
 // 表示一个任务，可能是短期任务也可能是长期任务
 class Task
@@ -195,8 +213,12 @@ public:
     Task(const std::string &name, Context *context) : name(name), context(context) {}
     virtual ~Task() {}
 
-    // 初始化任务
+    // 初始化任务，只在最开始运行一次。
+    // 如果初始化过程中需要发送什么数据包，可以在这里发送。
     virtual void Setup() {}
+
+    // 这个函数会被不断调用，可以在这个函数中添加定时检查，定时发送数据包。
+    virtual void Tick() {}
 
     enum ProcessResult
     {
@@ -205,7 +227,7 @@ public:
     };
     // 处理一个收到的数据包，如果这个数据包属于改Task，就返回`PROCESSED`，否则返回`NOT_PROCESSED`。
     // 每个数据包只能被一个Task处理。
-    virtual ProcessResult TryProcess(struct rte_mbuf *pkt) = 0;
+    virtual ProcessResult TryProcess(struct rte_mbuf *pkt) { return ProcessResult::NOT_PROCESSED; }
 
     // 任务是否还活着
     virtual bool IsAlive() { return true; }
@@ -272,7 +294,6 @@ private:
     }
 };
 
-// 常驻任务，响应ICMP Ping
 class PingReplyTask : public Task
 {
 public:
@@ -402,6 +423,164 @@ public:
     }
 };
 
+// 使用ARP协议查询MAC地址
+class ARPRequestTask : public Task
+{
+    rte_be32_t query_ip;             // 要查询的IP
+    struct rte_ether_addr *write_to; // 查询到MAC地址之后写到这里
+
+public:
+    ARPRequestTask(rte_be32_t query_ip, struct rte_ether_addr *write_to, const std::string &name, Context *context)
+        : Task(name, context), query_ip(query_ip), write_to(write_to)
+    {
+    }
+
+    virtual void Setup() override final
+    {
+        struct rte_mbuf *pkt = rte_pktmbuf_alloc(context->mbuf_pool);
+        if (!pkt)
+            rte_exit(EXIT_FAILURE, "Failed to alloc pkt\n");
+
+        struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+        rte_ether_addr_copy(&context->mac_addr, &eth_hdr->src_addr);
+        memset(&eth_hdr->dst_addr, 0xFF, sizeof(eth_hdr->dst_addr));
+        eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP);
+
+        struct rte_arp_hdr *arp_hdr = (struct rte_arp_hdr *)(eth_hdr + 1);
+        arp_hdr->arp_hardware = rte_cpu_to_be_16(RTE_ARP_HRD_ETHER);
+        arp_hdr->arp_protocol = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+        arp_hdr->arp_hlen = 6;
+        arp_hdr->arp_plen = 4;
+        arp_hdr->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REQUEST);
+        arp_hdr->arp_data.arp_sha = context->mac_addr;
+        arp_hdr->arp_data.arp_sip = context->ip_addr;
+        memset(&arp_hdr->arp_data.arp_tha, 0, sizeof(arp_hdr->arp_data.arp_tha));
+        arp_hdr->arp_data.arp_tip = query_ip;
+
+        // Fill other DPDK metadata
+        pkt->packet_type = RTE_PTYPE_L2_ETHER_ARP;
+        const uint32_t PKT_LEN = sizeof(*eth_hdr) + sizeof(*arp_hdr);
+        pkt->pkt_len = PKT_LEN;
+        pkt->data_len = pkt->pkt_len;
+        pkt->l2_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_arp_hdr);
+
+        const uint16_t nb_tx = rte_eth_tx_burst(PORT, 0, &pkt, 1);
+        assert(nb_tx == 1);
+
+        printf("[ARP] Sent ARP request for %s\n", format_ipv4(query_ip).c_str());
+    }
+
+    virtual ProcessResult TryProcess(struct rte_mbuf *pkt) override final
+    {
+        if (!IsAlive())
+            return ProcessResult::NOT_PROCESSED;
+
+        struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+        assert(eth_hdr);
+        if (rte_be_to_cpu_16(eth_hdr->ether_type) == RTE_ETHER_TYPE_ARP)
+        {
+            struct rte_arp_hdr *arp_hdr = (struct rte_arp_hdr *)(eth_hdr + 1);
+            if (rte_be_to_cpu_16(arp_hdr->arp_hardware) == RTE_ARP_HRD_ETHER && rte_be_to_cpu_16(arp_hdr->arp_protocol) == RTE_ETHER_TYPE_IPV4 && rte_be_to_cpu_16(arp_hdr->arp_opcode) == RTE_ARP_OP_REPLY)
+            {
+                if (arp_hdr->arp_data.arp_sip == query_ip)
+                {
+                    *write_to = arp_hdr->arp_data.arp_sha;
+                    printf("[ARP] MAC address for %s is " RTE_ETHER_ADDR_PRT_FMT "\n",
+                           format_ipv4(query_ip).c_str(),
+                           RTE_ETHER_ADDR_BYTES(write_to));
+                    return ProcessResult::PROCESSED;
+                }
+            }
+        }
+        return ProcessResult::NOT_PROCESSED;
+    }
+
+    // 根据`write_to`是否被写入了数据判断本次ARP请求是否结束
+    virtual bool IsAlive()
+    {
+        return is_mac_addr_empty(write_to);
+    }
+};
+
+// 向指定IP指定端口定时发送UDP数据包
+class UDPSendTask : public Task
+{
+    int src_port;
+    rte_be32_t dst_ip;
+    int dst_port;
+    struct rte_ether_addr *dst_mac_addr;
+
+    uint64_t tsc_hz;
+    uint64_t last_sent_at_tsc;
+
+public:
+    UDPSendTask(int src_port, rte_be32_t dst_ip, int dst_port, struct rte_ether_addr *dst_mac_addr, const std::string &name, Context *context)
+        : Task(name, context), src_port(src_port), dst_ip(dst_ip), dst_port(dst_port), dst_mac_addr(dst_mac_addr)
+    {
+        this->tsc_hz = rte_get_tsc_hz();
+        this->last_sent_at_tsc = rte_get_tsc_cycles();
+    }
+
+    virtual void Tick()
+    {
+        uint64_t now_tsc = rte_get_tsc_cycles();
+        if (now_tsc - last_sent_at_tsc < tsc_hz)
+        {
+            return;
+        }
+        last_sent_at_tsc = now_tsc;
+
+        struct rte_mbuf *pkt = rte_pktmbuf_alloc(context->mbuf_pool);
+        if (!pkt)
+            rte_exit(EXIT_FAILURE, "Failed to alloc pkt\n");
+
+        // UDP要发送的数据
+        const char *message = "Hello DPDK\n";
+
+        struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+        rte_ether_addr_copy(&context->mac_addr, &eth_hdr->src_addr);
+        rte_ether_addr_copy(dst_mac_addr, &eth_hdr->dst_addr);
+        eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+        struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+        memset(ip_hdr, 0, sizeof(*ip_hdr));
+        ip_hdr->version_ihl = IP_VHL_DEF;
+        ip_hdr->type_of_service = 0;
+        ip_hdr->fragment_offset = 0;
+        ip_hdr->time_to_live = IP_DEFTTL;
+        ip_hdr->packet_id = 0;
+        ip_hdr->src_addr = context->ip_addr;
+        ip_hdr->dst_addr = dst_ip;
+        ip_hdr->next_proto_id = IPPROTO_UDP;
+        ip_hdr->total_length = rte_cpu_to_be_16(sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr) + strlen(message));
+
+        struct rte_udp_hdr *udp_hdr = (struct rte_udp_hdr *)(ip_hdr + 1);
+        udp_hdr->src_port = rte_cpu_to_be_16(src_port);
+        udp_hdr->dst_port = rte_cpu_to_be_16(dst_port);
+        udp_hdr->dgram_len = rte_cpu_to_be_16(sizeof(*udp_hdr) + strlen(message));
+        udp_hdr->dgram_cksum = 0; // IPv4中UDP的Checksum可以不计算
+
+        rte_memcpy((void *)(udp_hdr + 1), message, strlen(message));
+
+        // Fill other DPDK metadata
+        pkt->packet_type = RTE_PTYPE_L2_ETHER | RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L4_UDP;
+        const uint32_t PKT_LEN = sizeof(*eth_hdr) + sizeof(*ip_hdr) + sizeof(*udp_hdr) + strlen(message);
+        pkt->pkt_len = PKT_LEN;
+        pkt->data_len = pkt->pkt_len;
+        pkt->l2_len = sizeof(struct rte_ether_hdr);
+        pkt->l3_len = sizeof(struct rte_ipv4_hdr);
+        pkt->l4_len = sizeof(struct rte_udp_hdr);
+        pkt->ol_flags |= (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM);
+
+        const uint16_t nb_tx = rte_eth_tx_burst(PORT, 0, &pkt, 1);
+        assert(nb_tx == 1);
+
+        printf("[UDP] Send UDP message from %s:%d to %s:%d\n",
+               format_ipv4(context->ip_addr).c_str(), src_port,
+               format_ipv4(dst_ip).c_str(), dst_port);
+    }
+};
+
 static void main_loop(Context *context)
 {
     printf("\nCore %u main loop. [Ctrl+C to quit]\n", rte_lcore_id());
@@ -413,6 +592,20 @@ static void main_loop(Context *context)
     }
 
     std::vector<std::unique_ptr<Task>> running_tasks;
+
+    // // 用于进行局域网测试的IP地址
+    // rte_be32_t lan_test_ip = rte_cpu_to_be_32(RTE_IPV4(192, 168, 86, 155));
+    // std::string lan_test_ip_str = "192.168.86.155";
+
+    // // 以下这些任务还没有满足条件，因此还不能放在`running_tasks`中。
+    // // 具体的触发条件见`Status::MAIN_LOOP`部分的处理逻辑。
+    // Task *send_udp_to_lan = new UDPSendTask(8080, lan_test_ip, 8080, &context->lan_dst_mac_addr, "UDPSend:" + lan_test_ip_str, context);
+
+    // 用于进行广域网测试的IP地址
+    rte_be32_t wan_test_ip = rte_cpu_to_be_32(RTE_IPV4(39, 107, 102, 23));
+    std::string wan_test_ip_str = "39.107.102.23";
+
+    Task *send_udp_to_wan = new UDPSendTask(8080, wan_test_ip, 8080, &context->gateway_mac_addr, "UDPSend:" + wan_test_ip_str, context);
 
 #define NEW_TASK(__)                                            \
     {                                                           \
@@ -601,6 +794,8 @@ static void main_loop(Context *context)
                                     NEW_TASK(new ARPReplyTask("ARPReply", context));
                                     NEW_TASK(new PingReplyTask("PingReply", context));
                                     NEW_TASK(new UDPReceiveTask(8080, "UDP:8080", context));
+                                    // NEW_TASK(new ARPRequestTask(lan_test_ip, &context->lan_dst_mac_addr, "ARPRequest:" + lan_test_ip_str, context));
+                                    NEW_TASK(new ARPRequestTask(context->gateway_addr, &context->gateway_mac_addr, "ARPRequest:gateway", context));
                                     MOVE_STATUS_TO(MAIN_LOOP);
                                 }
                             }
@@ -641,6 +836,24 @@ static void main_loop(Context *context)
                 {
                     it++;
                 }
+            }
+
+            for (auto &&task : running_tasks)
+            {
+                task->Tick();
+            }
+
+            // // 检查是否有`Task`的条件满足了
+            // if (send_udp_to_lan && !is_mac_addr_empty(&context->lan_dst_mac_addr))
+            // {
+            //     NEW_TASK(send_udp_to_lan);
+            //     send_udp_to_lan = nullptr;
+            // }
+
+            if (send_udp_to_wan && !is_mac_addr_empty(&context->gateway_mac_addr))
+            {
+                NEW_TASK(send_udp_to_wan);
+                send_udp_to_wan = nullptr;
             }
         }
         break;
