@@ -17,6 +17,7 @@
 #include <rte_icmp.h>
 #include <rte_ip.h>
 #include <rte_udp.h>
+#include <rte_tcp.h>
 
 // 默认网卡配置
 static struct rte_eth_conf port_conf = {
@@ -25,7 +26,7 @@ static struct rte_eth_conf port_conf = {
     },
     .txmode = {
         .mq_mode = RTE_ETH_MQ_TX_NONE,
-        .offloads = (RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_MULTI_SEGS),
+        .offloads = (RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_TCP_CKSUM | RTE_ETH_TX_OFFLOAD_MULTI_SEGS),
     },
 };
 
@@ -294,6 +295,7 @@ private:
     }
 };
 
+// 常驻任务，响应ICMP Ping
 class PingReplyTask : public Task
 {
 public:
@@ -496,7 +498,7 @@ public:
     }
 
     // 根据`write_to`是否被写入了数据判断本次ARP请求是否结束
-    virtual bool IsAlive()
+    virtual bool IsAlive() override final
     {
         return is_mac_addr_empty(write_to);
     }
@@ -521,7 +523,7 @@ public:
         this->last_sent_at_tsc = rte_get_tsc_cycles();
     }
 
-    virtual void Tick()
+    virtual void Tick() override final
     {
         uint64_t now_tsc = rte_get_tsc_cycles();
         if (now_tsc - last_sent_at_tsc < tsc_hz)
@@ -581,6 +583,286 @@ public:
     }
 };
 
+// 表示一个TCP上下文，包含当前的状态/序列号等信息
+struct TCB
+{
+    struct rte_ether_addr remote_mac_addr;
+    rte_be32_t remote_ip;
+    rte_be16_t remote_port;
+    rte_be16_t local_port;
+
+    enum class Status
+    {
+        LISTEN = 0,
+        SYN_SENT,
+        SYN_RECEIVED,
+        ESTABLISHED,
+        FIN_WAIT_1,
+        FIN_WAIT_2,
+        CLOSE_WAIT,
+        CLOSING,
+        LAST_ACK,
+        TIME_WAIT,
+        CLOSED,
+    };
+    Status status;
+
+    uint32_t seq;
+    uint32_t ack;
+};
+
+// 一个TCP连接，包含建立连接/接收消息和定时发送消息/断开连接3个阶段
+// 不会主动断开连接，对方断开连接时Task结束
+class TCPConnectionTask : public Task
+{
+    TCB tcb;
+
+    uint64_t tsc_hz;
+    uint64_t last_sent_at_tsc;
+
+public:
+    TCPConnectionTask(const std::string &name,
+                      Context *context,
+                      struct rte_ether_addr remote_mac_addr,
+                      rte_be32_t remote_ip,
+                      rte_be16_t remote_port,
+                      rte_be16_t local_port) : Task(name, context)
+    {
+        memset(&tcb, 0, sizeof(tcb));
+        tcb.remote_mac_addr = remote_mac_addr;
+        tcb.remote_ip = remote_ip;
+        tcb.remote_port = remote_port;
+        tcb.local_port = local_port;
+        tcb.status = TCB::Status::LISTEN;
+        tcb.seq = rand();
+
+        this->tsc_hz = rte_get_tsc_hz();
+        this->last_sent_at_tsc = rte_get_tsc_cycles();
+    }
+
+    virtual void Tick() override final
+    {
+        switch (tcb.status)
+        {
+        case TCB::Status::LISTEN:
+        {
+            auto _ = CreatePKT(4 + 2 + 10 + 1 + 3, 0);
+            struct rte_mbuf *pkt = std::get<0>(_);
+            struct rte_tcp_hdr *tcp_hdr = std::get<2>(_);
+            tcp_hdr->tcp_flags |= RTE_TCP_SYN_FLAG;
+
+            uint8_t *options = (uint8_t *)(tcp_hdr + 1);
+            { // MSS Option
+                options[0] = 2;
+                options[1] = 4;
+                *(rte_be16_t *)(options + 2) = rte_cpu_to_be_16(1460);
+                options += 4;
+            }
+            { // SACK permitted
+                options[0] = 4;
+                options[1] = 2;
+                options += 2;
+            }
+            { // Timestamp Option
+                options[0] = 8;
+                options[1] = 10;
+                *(rte_be32_t *)(options + 2) = rte_cpu_to_be_32(clock());
+                options += 10;
+            }
+            { // No OP
+                options[0] = 1;
+                options += 1;
+            }
+            { // Window scale
+                options[0] = 3;
+                options[1] = 3;
+                options[2] = 7;
+                options += 3;
+            }
+
+            const uint16_t nb_tx = rte_eth_tx_burst(PORT, 0, &pkt, 1);
+            assert(nb_tx == 1);
+
+            printf("[TCP] Sent SYN\n");
+            tcb.status = TCB::Status::SYN_SENT;
+        }
+        break;
+        case TCB::Status::ESTABLISHED:
+        {
+            uint64_t now_tsc = rte_get_tsc_cycles();
+            if (now_tsc - last_sent_at_tsc < tsc_hz * 5)
+            {
+                return;
+            }
+            last_sent_at_tsc = now_tsc;
+
+            const char *message = "Hello DPDK TCP\n";
+            auto _ = CreatePKT(0, strlen(message));
+            struct rte_mbuf *pkt = std::get<0>(_);
+            struct rte_tcp_hdr *tcp_hdr = std::get<2>(_);
+            tcp_hdr->tcp_flags |= RTE_TCP_PSH_FLAG | RTE_TCP_ACK_FLAG;
+            memcpy(tcp_hdr + 1, message, strlen(message));
+
+            const uint16_t nb_tx = rte_eth_tx_burst(PORT, 0, &pkt, 1);
+            assert(nb_tx == 1);
+            printf("[TCP] Sent message\n");
+        }
+        break;
+        default:
+            // nothing
+            break;
+        }
+    }
+
+    virtual ProcessResult TryProcess(struct rte_mbuf *pkt) override final
+    {
+        struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+        assert(eth_hdr);
+        if (rte_be_to_cpu_16(eth_hdr->ether_type) == RTE_ETHER_TYPE_IPV4)
+        {
+            struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+            if (ip_hdr->dst_addr == context->ip_addr && ip_hdr->src_addr == tcb.remote_ip && ip_hdr->next_proto_id == IPPROTO_TCP)
+            {
+                struct rte_tcp_hdr *tcp_hdr = (struct rte_tcp_hdr *)(ip_hdr + 1);
+                if (tcp_hdr->src_port == tcb.remote_port && tcp_hdr->dst_port == tcb.local_port)
+                {
+                    switch (tcb.status)
+                    {
+                    case TCB::Status::SYN_SENT:
+                    {
+                        if ((tcp_hdr->tcp_flags & RTE_TCP_SYN_FLAG) && (tcp_hdr->tcp_flags & RTE_TCP_ACK_FLAG) && (rte_be_to_cpu_32(tcp_hdr->recv_ack) == tcb.seq + 1))
+                        {
+                            printf("[TCP] SYN,ACK Received\n");
+
+                            tcb.seq++;
+                            tcb.ack = rte_be_to_cpu_32(tcp_hdr->sent_seq) + 1;
+
+                            auto _ = CreatePKT(0, 0);
+                            struct rte_mbuf *pkt = std::get<0>(_);
+                            struct rte_tcp_hdr *tcp_hdr = std::get<2>(_);
+                            tcp_hdr->tcp_flags |= RTE_TCP_ACK_FLAG;
+                            const uint16_t nb_tx = rte_eth_tx_burst(PORT, 0, &pkt, 1);
+                            assert(nb_tx == 1);
+                            printf("[TCP] Sent ACK\n");
+                            tcb.status = TCB::Status::ESTABLISHED;
+
+                            return ProcessResult::PROCESSED;
+                        }
+                    }
+                    break;
+                    case TCB::Status::ESTABLISHED:
+                    {
+                        if (tcp_hdr->tcp_flags & RTE_TCP_ACK_FLAG)
+                        {
+                            tcb.seq = rte_be_to_cpu_32(tcp_hdr->recv_ack);
+                        }
+                        if (rte_be_to_cpu_32(tcp_hdr->sent_seq) == tcb.ack)
+                        {
+                            uint8_t *payload = (uint8_t *)tcp_hdr + (uint32_t)(tcp_hdr->data_off >> 4) * 4;
+                            int payload_length = rte_be_to_cpu_16(ip_hdr->total_length) - (payload - (uint8_t *)ip_hdr);
+                            if (payload_length > 0)
+                            {
+                                printf("[TCP] Received data (length=%d): %s\n", payload_length, std::string((char *)payload, payload_length).c_str());
+
+                                tcb.ack += payload_length;
+
+                                auto _ = CreatePKT(0, 0);
+                                struct rte_mbuf *pkt = std::get<0>(_);
+                                struct rte_tcp_hdr *tcp_hdr = std::get<2>(_);
+                                tcp_hdr->tcp_flags |= RTE_TCP_ACK_FLAG;
+                                const uint16_t nb_tx = rte_eth_tx_burst(PORT, 0, &pkt, 1);
+                                assert(nb_tx == 1);
+                                printf("[TCP] Relay ACK\n");
+                            }
+                        }
+                        if (tcp_hdr->tcp_flags & RTE_TCP_FIN_FLAG)
+                        {
+                            auto _ = CreatePKT(0, 0);
+                            struct rte_mbuf *pkt = std::get<0>(_);
+                            struct rte_tcp_hdr *tcp_hdr = std::get<2>(_);
+                            tcp_hdr->tcp_flags |= RTE_TCP_FIN_FLAG | RTE_TCP_ACK_FLAG;
+
+                            const uint16_t nb_tx = rte_eth_tx_burst(PORT, 0, &pkt, 1);
+                            assert(nb_tx == 1);
+                            printf("[TCP] Sent FIN\n");
+                            tcb.status = TCB::Status::LAST_ACK;
+                        }
+                        return ProcessResult::PROCESSED;
+                    }
+                    break;
+                    case TCB::Status::LAST_ACK:
+                    {
+                        if (tcp_hdr->tcp_flags & RTE_TCP_ACK_FLAG)
+                        {
+                            printf("[TCP] Closed\n");
+                            tcb.status = TCB::Status::CLOSED;
+                        }
+                    }
+                    break;
+                    default:
+                        // nothing
+                        break;
+                    };
+                }
+            }
+        }
+
+        return ProcessResult::NOT_PROCESSED;
+    }
+
+    virtual bool IsAlive() override final { return tcb.status != TCB::Status::CLOSED; }
+
+private:
+    std::tuple<struct rte_mbuf *, struct rte_ipv4_hdr *, struct rte_tcp_hdr *> CreatePKT(uint32_t options_length, uint32_t payload_length)
+    {
+        options_length = (options_length + 3) / 4 * 4;
+
+        struct rte_mbuf *pkt = rte_pktmbuf_alloc(context->mbuf_pool);
+        if (!pkt)
+            rte_exit(EXIT_FAILURE, "Failed to alloc pkt\n");
+
+        struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+        rte_ether_addr_copy(&context->mac_addr, &eth_hdr->src_addr);
+        rte_ether_addr_copy(&tcb.remote_mac_addr, &eth_hdr->dst_addr);
+        eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+        struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+        memset(ip_hdr, 0, sizeof(*ip_hdr));
+        ip_hdr->version_ihl = IP_VHL_DEF;
+        ip_hdr->type_of_service = 0;
+        ip_hdr->fragment_offset = 0x40; // 高3位是flags
+        ip_hdr->time_to_live = IP_DEFTTL;
+        ip_hdr->packet_id = rte_cpu_to_be_16(0x7acb);
+        ip_hdr->src_addr = context->ip_addr;
+        ip_hdr->dst_addr = tcb.remote_ip;
+        ip_hdr->next_proto_id = IPPROTO_TCP;
+        ip_hdr->total_length = rte_cpu_to_be_16(sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr) + options_length + payload_length);
+
+        struct rte_tcp_hdr *tcp_hdr = (struct rte_tcp_hdr *)(ip_hdr + 1);
+        memset(tcp_hdr, 0, sizeof(*tcp_hdr) + options_length);
+        tcp_hdr->src_port = tcb.local_port;
+        tcp_hdr->dst_port = tcb.remote_port;
+        tcp_hdr->sent_seq = rte_cpu_to_be_32(tcb.seq);
+        tcp_hdr->recv_ack = rte_cpu_to_be_32(tcb.ack);
+        tcp_hdr->data_off = ((sizeof(*tcp_hdr) + options_length) / 4) << 4; // data_off实际只占用4bit，另外4bit保留位应该设为0
+        tcp_hdr->rx_win = rte_cpu_to_be_16(0xfaf0);
+
+        // Fill other DPDK metadata
+        pkt->packet_type = RTE_PTYPE_L2_ETHER | RTE_PTYPE_L3_IPV4 | RTE_PTYPE_L4_TCP;
+        const uint32_t PKT_LEN = sizeof(*eth_hdr) + sizeof(*ip_hdr) + sizeof(*tcp_hdr) + options_length + payload_length;
+        pkt->pkt_len = PKT_LEN;
+        pkt->data_len = pkt->pkt_len;
+        pkt->l2_len = sizeof(struct rte_ether_hdr);
+        pkt->l3_len = sizeof(struct rte_ipv4_hdr);
+        pkt->l4_len = sizeof(struct rte_tcp_hdr);
+        pkt->ol_flags |= (RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM);
+
+        tcp_hdr->cksum = rte_ipv4_phdr_cksum(ip_hdr, pkt->ol_flags);
+
+        return {pkt, ip_hdr, tcp_hdr};
+    }
+};
+
 static void main_loop(Context *context)
 {
     printf("\nCore %u main loop. [Ctrl+C to quit]\n", rte_lcore_id());
@@ -593,19 +875,21 @@ static void main_loop(Context *context)
 
     std::vector<std::unique_ptr<Task>> running_tasks;
 
-    // // 用于进行局域网测试的IP地址
-    // rte_be32_t lan_test_ip = rte_cpu_to_be_32(RTE_IPV4(192, 168, 86, 155));
-    // std::string lan_test_ip_str = "192.168.86.155";
+    // 用于进行局域网测试的IP地址
+    rte_be32_t lan_test_ip = rte_cpu_to_be_32(RTE_IPV4(192, 168, 86, 155));
+    std::string lan_test_ip_str = "192.168.86.155";
 
     // // 以下这些任务还没有满足条件，因此还不能放在`running_tasks`中。
     // // 具体的触发条件见`Status::MAIN_LOOP`部分的处理逻辑。
     // Task *send_udp_to_lan = new UDPSendTask(8080, lan_test_ip, 8080, &context->lan_dst_mac_addr, "UDPSend:" + lan_test_ip_str, context);
 
-    // 用于进行广域网测试的IP地址
-    rte_be32_t wan_test_ip = rte_cpu_to_be_32(RTE_IPV4(39, 107, 102, 23));
-    std::string wan_test_ip_str = "39.107.102.23";
+    // // 用于进行广域网测试的IP地址
+    // rte_be32_t wan_test_ip = rte_cpu_to_be_32(RTE_IPV4(39, 107, 102, 23));
+    // std::string wan_test_ip_str = "39.107.102.23";
 
-    Task *send_udp_to_wan = new UDPSendTask(8080, wan_test_ip, 8080, &context->gateway_mac_addr, "UDPSend:" + wan_test_ip_str, context);
+    // Task *send_udp_to_wan = new UDPSendTask(8080, wan_test_ip, 8080, &context->gateway_mac_addr, "UDPSend:" + wan_test_ip_str, context);
+
+    bool has_created_tcp_task = false;
 
 #define NEW_TASK(__)                                            \
     {                                                           \
@@ -794,8 +1078,8 @@ static void main_loop(Context *context)
                                     NEW_TASK(new ARPReplyTask("ARPReply", context));
                                     NEW_TASK(new PingReplyTask("PingReply", context));
                                     NEW_TASK(new UDPReceiveTask(8080, "UDP:8080", context));
-                                    // NEW_TASK(new ARPRequestTask(lan_test_ip, &context->lan_dst_mac_addr, "ARPRequest:" + lan_test_ip_str, context));
-                                    NEW_TASK(new ARPRequestTask(context->gateway_addr, &context->gateway_mac_addr, "ARPRequest:gateway", context));
+                                    NEW_TASK(new ARPRequestTask(lan_test_ip, &context->lan_dst_mac_addr, "ARPRequest:" + lan_test_ip_str, context));
+                                    // NEW_TASK(new ARPRequestTask(context->gateway_addr, &context->gateway_mac_addr, "ARPRequest:gateway", context));
                                     MOVE_STATUS_TO(MAIN_LOOP);
                                 }
                             }
@@ -850,10 +1134,16 @@ static void main_loop(Context *context)
             //     send_udp_to_lan = nullptr;
             // }
 
-            if (send_udp_to_wan && !is_mac_addr_empty(&context->gateway_mac_addr))
+            // if (send_udp_to_wan && !is_mac_addr_empty(&context->gateway_mac_addr))
+            // {
+            //     NEW_TASK(send_udp_to_wan);
+            //     send_udp_to_wan = nullptr;
+            // }
+
+            if (!has_created_tcp_task && !is_mac_addr_empty(&context->lan_dst_mac_addr))
             {
-                NEW_TASK(send_udp_to_wan);
-                send_udp_to_wan = nullptr;
+                NEW_TASK(new TCPConnectionTask("TCP:" + lan_test_ip_str, context, context->lan_dst_mac_addr, lan_test_ip, rte_cpu_to_be_16(8080), rte_cpu_to_be_16(rand() % 10000 + 1000)));
+                has_created_tcp_task = true;
             }
         }
         break;
